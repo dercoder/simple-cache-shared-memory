@@ -1,0 +1,32 @@
+{
+    "name": "dercoder/simple-cache-shared-memory",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "psr-16",
+        "simple-cache",
+        "cache",
+        "shared-memory",
+        "shm"
+    ],
+    "autoload": {
+        "psr-4": {
+            "DerCoder\\SimpleCache\\SharedMemory\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Alexander Fedra",
+            "email": "alexander.fedra@example.com"
+        }
+    ],
+    "require": {
+        "php": ">=7.3",
+        "ext-shmop": "*",
+        "psr/simple-cache": "^1.0",
+        "symfony/polyfill-php82": "^1.30"
+    },
+    "suggest": {
+        "ext-igbinary": "For faster serialization of values"
+    }
+}
