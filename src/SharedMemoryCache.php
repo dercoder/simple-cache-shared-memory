@@ -4,6 +4,7 @@ namespace DerCoder\SimpleCache\SharedMemory;
 
 use DateInterval;
 use DateTime;
+use Exception;
 use Psr\SimpleCache\CacheInterface;
 use Psr\SimpleCache\InvalidArgumentException;
 use RuntimeException;
@@ -12,7 +13,7 @@ class SharedMemoryCache implements CacheInterface
 {
     const SERIALIZER_PHP = 'php';
     const SERIALIZER_IGBINARY = 'igbinary';
-    const HASH_CRC32 = 'crc32';
+    const HASH_ALGORITHM_CRC32 = 'crc32';
 
     /**
      * @var resource
@@ -25,26 +26,67 @@ class SharedMemoryCache implements CacheInterface
     protected $size;
 
     /**
-     * @var array
+     * @var int
      */
-    protected $options;
+    protected $key;
+
+    /**
+     * @var string
+     */
+    protected $hashAlgorithm;
+
+    /**
+     * @var string
+     */
+    protected $serializer;
+
+    /**
+     * @var int
+     */
+    protected $compressionLevel;
+
+    /**
+     * @var int
+     */
+    protected $permissions;
 
     /**
      * @param string|int $size
      * @param array      $options
+     *
+     * @throws Exception
      */
     public function __construct($size, array $options = [])
     {
         $this->size = ini_parse_quantity($size);
-        $this->options = array_merge([
-            'key'         => ftok(__FILE__, 'S'),
-            'hash'        => self::HASH_CRC32,
-            'serializer'  => self::SERIALIZER_PHP,
-            'permissions' => 0666
+        $options = array_merge([
+            'key'              => ftok(__FILE__, 'S'),
+            'hashAlgorithm'    => self::HASH_ALGORITHM_CRC32,
+            'serializer'       => self::SERIALIZER_PHP,
+            'compressionLevel' => 6,
+            'permissions'      => 0666
         ], $options);
 
-        if (!$this->shm = shm_attach($this->options['key'], $this->size, $this->options['permissions'])) {
-            throw new RuntimeException('Failed to attach shared memory segment');
+        $this->key = $options['key'];
+        $this->hashAlgorithm = $options['hashAlgorithm'];
+        $this->serializer = $options['serializer'];
+        $this->compressionLevel = $options['compressionLevel'];
+        $this->permissions = $options['permissions'];
+
+        if ($this->serializer === self::SERIALIZER_IGBINARY && !extension_loaded('igbinary')) {
+            throw new Exception('Igbinary extension is not installed');
+        }
+
+        $this->createSharedMemorySegment();
+    }
+
+    /**
+     * Disconnect from shared memory segment.
+     */
+    public function __destruct()
+    {
+        if ($this->shm) {
+            shm_detach($this->shm);
         }
     }
 
@@ -57,15 +99,19 @@ class SharedMemoryCache implements CacheInterface
      */
     public function get($key, $default = null)
     {
-        if (!$result = shm_get_var($this->shm, $this->getHashKey($key))) {
+        if (!$this->has($key)) {
             return $default;
         }
 
-        $data = $this->unserialize($result);
+        $data = shm_get_var($this->shm, $this->getHashKey($key));
+        $data = $this->unserialize(
+            $this->decompress($data)
+        );
+
         $expires = $data['expires'];
         $payload = $data['payload'];
 
-        if ($expires <= new DateTime()) {
+        if ($expires instanceof DateTime && $expires <= new DateTime()) {
             $this->delete($key);
             return $default;
         }
@@ -83,10 +129,12 @@ class SharedMemoryCache implements CacheInterface
      */
     public function set($key, $value, $ttl = null): bool
     {
-        $data = $this->serialize([
-            'payload' => $value,
-            'expires' => $this->calculateExpiration($ttl)
-        ]);
+        $data = $this->compress(
+            $this->serialize([
+                'payload' => $value,
+                'expires' => $this->calculateExpiration($ttl)
+            ])
+        );
 
         return shm_put_var($this->shm, $this->getHashKey($key), $data);
     }
@@ -101,24 +149,87 @@ class SharedMemoryCache implements CacheInterface
         return shm_remove_var($this->shm, $this->getHashKey($key));
     }
 
-    public function clear()
+    /**
+     * @return bool
+     */
+    public function clear(): bool
     {
-        // TODO: Implement clear() method.
+        $this->removeSharedMemorySegment();
+        $this->createSharedMemorySegment();
+        return true;
     }
 
+    /**
+     * @return bool
+     */
+    public function destroy(): bool
+    {
+        $this->removeSharedMemorySegment();
+        return true;
+    }
+
+    /**
+     * @param $keys
+     * @param $default
+     *
+     * @return iterable
+     * @throws InvalidArgumentException
+     */
     public function getMultiple($keys, $default = null)
     {
-        // TODO: Implement getMultiple() method.
+        $result = [];
+
+        foreach ($keys as $key) {
+            $result[$key] = $this->get($key, $default);
+        }
+
+        return $result;
     }
 
-    public function setMultiple($values, $ttl = null)
+    /**
+     * @param $values
+     * @param $ttl
+     *
+     * @return bool
+     * @throws InvalidArgumentException
+     */
+    public function setMultiple($values, $ttl = null): bool
     {
-        // TODO: Implement setMultiple() method.
+        $result = true;
+
+        if (!$values) {
+            return false;
+        }
+
+        foreach ($values as $key => $value) {
+            if (!$this->set($key, $value, $ttl)) {
+                $result = false;
+            }
+        }
+
+        return $result;
     }
 
-    public function deleteMultiple($keys)
+    /**
+     * @param $keys
+     *
+     * @return bool
+     */
+    public function deleteMultiple($keys): bool
     {
-        // TODO: Implement deleteMultiple() method.
+        $result = true;
+
+        if (!$keys) {
+            return false;
+        }
+
+        foreach ($keys as $key) {
+            if (!$this->delete($key)) {
+                $result = false;
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -132,24 +243,57 @@ class SharedMemoryCache implements CacheInterface
     }
 
     /**
+     * @return void
+     */
+    protected function createSharedMemorySegment(): void
+    {
+        if ($this->shm) {
+            return;
+        }
+
+        if (!$this->shm = shm_attach($this->key, $this->size, $this->permissions)) {
+            throw new RuntimeException('Failed to attach shared memory segment');
+        }
+    }
+
+    /**
+     * @return void
+     */
+    protected function removeSharedMemorySegment(): void
+    {
+        if (!$this->shm) {
+            return;
+        }
+
+        if (!shm_remove($this->shm)) {
+            throw new RuntimeException('Failed to remove shared memory segment');
+        }
+
+        unset($this->shm);
+    }
+
+    /**
      * @param string $key
      *
      * @return int
      */
     protected function getHashKey(string $key): int
     {
-        $hash = hash($this->options['hash'], $key);
+        $hash = hash($this->hashAlgorithm, $key);
         return hexdec($hash);
     }
 
     /**
      * @param null|int|DateInterval $ttl
      *
+     * @return DateTime|null
      * @throws InvalidArgumentException
      */
-    private function calculateExpiration($ttl): DateTime
+    protected function calculateExpiration($ttl): ?DateTime
     {
-        if (is_int($ttl)) {
+        if ($ttl === null) {
+            return null;
+        } elseif (is_int($ttl) && $ttl > 0) {
             return (new DateTime())->add(new DateInterval("PT{$ttl}S"));
         } elseif ($ttl instanceof DateInterval) {
             return (new DateTime())->add($ttl);
@@ -161,12 +305,40 @@ class SharedMemoryCache implements CacheInterface
     /**
      * @param string $data
      *
+     * @return string
+     */
+    protected function compress(string $data): string
+    {
+        if (!$data = gzcompress($data, $this->compressionLevel)) {
+            throw new RuntimeException('Failed to compress data');
+        }
+
+        return $data;
+    }
+
+    /**
+     * @param string $data
+     *
+     * @return string
+     */
+    protected function decompress(string $data): string
+    {
+        if (!$data = gzuncompress($data)) {
+            throw new RuntimeException('Failed to decompress data');
+        }
+
+        return $data;
+    }
+
+    /**
+     * @param string $data
+     *
      * @return mixed
      * @throws InvalidSerializerException
      */
-    private function unserialize(string $data)
+    protected function unserialize(string $data)
     {
-        switch ($this->options['serializer']) {
+        switch ($this->serializer) {
             case self::SERIALIZER_PHP:
                 return unserialize($data);
             case self::SERIALIZER_IGBINARY:
@@ -181,9 +353,9 @@ class SharedMemoryCache implements CacheInterface
      *
      * @return string|null
      */
-    private function serialize($data): ?string
+    protected function serialize($data): ?string
     {
-        switch ($this->options['serializer']) {
+        switch ($this->serializer) {
             case self::SERIALIZER_PHP:
                 return serialize($data);
             case self::SERIALIZER_IGBINARY:
